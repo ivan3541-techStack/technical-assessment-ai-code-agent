@@ -1,18 +1,15 @@
-from .security import SECURITY_PROMPT
-from .performance import PERFORMANCE_PROMPT
-from .observability import OBSERVABILITY_PROMPT
-from .architecture import ARCHITECTURE_PROMPT
+from .project_context import PROJECT_CONTEXT_PROMPT
+from .best_practices import BEST_PRACTICES_PROMPT
+from .file_audit import FILE_AUDIT_PROMPT
 
 PROMPTS = {
-    "security": SECURITY_PROMPT,
-    "performance": PERFORMANCE_PROMPT,
-    "observability": OBSERVABILITY_PROMPT,
-    "architecture": ARCHITECTURE_PROMPT,
+    "project_context": PROJECT_CONTEXT_PROMPT,
+    "best_practices": BEST_PRACTICES_PROMPT,
+    "file_audit": FILE_AUDIT_PROMPT,
 }
 
 ALL_PROMPTS = [
-    ("security", SECURITY_PROMPT),
-    ("performance", PERFORMANCE_PROMPT),
-    ("observability", OBSERVABILITY_PROMPT),
-    ("architecture", ARCHITECTURE_PROMPT),
+    ("project_context", PROJECT_CONTEXT_PROMPT),
+    ("best_practices", BEST_PRACTICES_PROMPT),
+    ("file_audit", FILE_AUDIT_PROMPT),
 ]

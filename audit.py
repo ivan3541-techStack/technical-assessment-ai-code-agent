@@ -1,278 +1,812 @@
 #!/usr/bin/env python3
 """
-Local AI Code Auditor with OPTIMIZED parallel processing.
-Single-level ThreadPoolExecutor for better performance.
+Local AI Code Auditor with project-level context and structured issues.
+Refactored version with improved architecture, separation of concerns, and maintainability.
+
+Author: AI Code Auditor Team
+Version: 2.0.0
 """
 
-import os
-import json
-import textwrap
-import requests
 import argparse
+import json
+import logging
+import os
+import sys
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from prompts import ALL_PROMPTS, PROMPTS
+from typing import Dict, List, Optional, Tuple
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-EXTENSIONS = {".js", ".ts", ".tsx", ".jsx", ".py", ".java", ".go", ".rb", ".php", ".cs", ".kt", ".swift", ".rs"}
+import requests
 
-# ✅ Configurable exclusions
-EXCLUDE_DIRS = {
-    ".git", "node_modules", "dist", "build", ".venv", "venv", "__pycache__",
-    ".next", ".nuxt", ".cache", "coverage", "target", "out", "bin", "obj",
-    ".mypy_cache", ".pytest_cache", "logs", "static", "public", ".idea", ".vscode",
-}
+from config import (
+    CONFIG_PATTERNS,
+    DEFAULT_NUM_PREDICT,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_P,
+    DEFAULT_WORKERS,
+    EXCLUDE_DIRS,
+    EXTENSIONS,
+    MAX_CODE_LENGTH,
+    MIN_FILE_SIZE,
+    OLLAMA_HEALTH_URL,
+    OLLAMA_TIMEOUT,
+    OLLAMA_URL,
+    PROJECT_META_CANDIDATES,
+    REPORTS_DIR,
+    REPORT_FILENAME_PATTERN,
+    TIMESTAMP_FORMAT,
+)
+from models import Issue, Severity
+from prompts import PROMPTS
 
-CONFIG_PATTERNS = {
-    "package.json", "jest.config.js", "jest.config.ts", "vite.config.js", "vite.config.ts",
-    "webpack.config.js", "tsconfig.json", ".eslintrc.js", ".prettierrc.js", "rollup.config.js",
-    "babel.config.js", "next.config.js", ".env", ".env.local", ".gitignore", ".dockerignore",
-}
-
-
-def iter_code_files(repo_path: str) -> List[str]:
-    """Iterate through code files (skip config files and excluded dirs)."""
-    files = []
-    repo = Path(repo_path)
-
-    for root, dirs, files_in_dir in os.walk(repo):
-        # ✅ Exclude directories
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-
-        for file in files_in_dir:
-            file_path = Path(root) / file
-
-            # Skip config files
-            if file_path.name in CONFIG_PATTERNS:
-                continue
-
-            # Only code files with minimum size
-            if file_path.suffix.lower() in EXTENSIONS and file_path.stat().st_size > 100:
-                files.append(str(file_path))
-
-    return files
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-def call_ollama(prompt: str, model: str) -> str:
-    """Request to local Ollama."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "num_predict": 512,
+
+# ==== Utility Classes ====
+
+class JSONExtractor:
+    """Utility class for extracting JSON from LLM responses."""
+
+    @staticmethod
+    def extract_object(text: str) -> Optional[dict]:
+        """
+        Extract first JSON object {...} from text.
+
+        Args:
+            text: Text containing potential JSON object
+
+        Returns:
+            Parsed dictionary or None if extraction fails
+        """
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        brace_level = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                brace_level += 1
+            elif ch == "}":
+                brace_level -= 1
+                if brace_level == 0:
+                    try:
+                        return json.loads(text[start:i+1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    @staticmethod
+    def extract_array(text: str) -> Optional[list]:
+        """
+        Extract JSON array from text, ignoring markdown code blocks.
+
+        Args:
+            text: Text containing potential JSON array
+
+        Returns:
+            Parsed list or None if extraction fails
+        """
+        text = text.strip()
+
+        # Remove markdown code blocks
+        if text.startswith("```json"):
+            text = text[7:].strip()
+        elif text.startswith("```"):
+            text = text[3:].strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
+
+        # Find first [ and last ]
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start == -1 or end <= start:
+            return None
+
+        snippet = text[start:end].strip()
+        try:
+            data = json.loads(snippet)
+            return data if isinstance(data, list) else None
+        except json.JSONDecodeError:
+            return None
+
+
+class OllamaClient:
+    """Client for interacting with Ollama API."""
+
+    def __init__(self, model: str):
+        """
+        Initialize Ollama client.
+
+        Args:
+            model: Name of the Ollama model to use
+        """
+        self.model = model
+
+    @staticmethod
+    def check_availability() -> bool:
+        """
+        Check if Ollama service is running.
+
+        Returns:
+            True if Ollama is accessible, False otherwise
+        """
+        try:
+            requests.get(OLLAMA_HEALTH_URL, timeout=5)
+            return True
+        except Exception:
+            return False
+
+    def generate(self, prompt: str, num_predict: Optional[int] = None) -> str:
+        """
+        Generate response from Ollama model.
+
+        Args:
+            prompt: Input prompt for the model
+            num_predict: Maximum number of tokens to generate
+
+        Returns:
+            Model response text
+
+        Raises:
+            requests.HTTPError: If API request fails
+        """
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": DEFAULT_TEMPERATURE,
+                "top_p": DEFAULT_TOP_P,
+                "num_predict": num_predict or DEFAULT_NUM_PREDICT,
+            }
         }
-    }
-
-    try:
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=700)
+        resp = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=OLLAMA_TIMEOUT
+        )
         resp.raise_for_status()
         data = resp.json()
         return data.get("response", "").strip()
-    except requests.exceptions.RequestException as e:
-        return f"ERROR: {e}"
 
 
-def build_prompt(template: str, code: str, filename: str, context: str = "") -> str:
-    """Build prompt with variable substitution."""
-    max_code_len = 6000
-    if len(code) > max_code_len:
-        code = code[:max_code_len] + "\n\n[... truncated ...]"
+# ==== File and Project Analysis ====
 
-    prompt = template.replace("{{code}}", code)
-    prompt = prompt.replace("{{filename}}", filename)
-    prompt = prompt.replace("{{context}}", context)
-    return prompt
+class FileScanner:
+    """Scans repository for code files to audit."""
 
+    def __init__(self, repo_path: Path):
+        """
+        Initialize file scanner.
 
-def audit_task(task: Tuple[str, str, str, str, str]) -> Tuple[str, str, Dict]:
-    """
-    Single audit task: (file_path, repo_root, prompt_name, prompt_template, model).
-    FLAT parallelization: no nested ThreadPoolExecutor.
-    """
-    file_path, repo_root, prompt_name, prompt_template, model = task
+        Args:
+            repo_path: Root path of repository to scan
+        """
+        self.repo_path = repo_path
 
-    rel_path = os.path.relpath(file_path, repo_root)
+    def scan(self, limit: Optional[int] = None) -> List[str]:
+        """
+        Scan repository for code files.
 
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            code = f.read()
-    except Exception as e:
-        return rel_path, prompt_name, {"error": f"Cannot read file: {e}"}
+        Args:
+            limit: Maximum number of files to process (None for no limit)
 
-    try:
-        prompt = build_prompt(prompt_template, code, rel_path)
-        raw_response = call_ollama(prompt, model)
+        Returns:
+            List of file paths
+        """
+        files = []
 
-        # Parse JSON
-        try:
-            start = raw_response.find("{")
-            end = raw_response.rfind("}") + 1
-            if start != -1 and end > start:
-                json_str = raw_response[start:end]
-                parsed = json.loads(json_str)
-            else:
-                parsed = {"raw": raw_response}
-        except json.JSONDecodeError:
-            parsed = {"raw": raw_response}
+        for root, dirs, files_in_dir in os.walk(self.repo_path):
+            # Filter out excluded directories
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
 
-        return rel_path, prompt_name, parsed
-    except Exception as e:
-        return rel_path, prompt_name, {"error": str(e)}
+            for file in files_in_dir:
+                file_path = Path(root) / file
 
-
-def generate_report(all_results: List[Tuple[str, Dict]], repo_path: str, output_path: str,
-                    model: str, selected_prompts: List[Tuple[str, str]]):
-    """Generate Markdown report."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("# Technical Audit Report\n\n")
-        f.write(f"**Repository**: `{repo_path}`\n")
-        f.write(f"**Model**: `{model}`\n")
-        f.write(f"**Generated**: {ts}\n")
-        f.write(f"**Files analyzed**: {len(all_results)}\n")
-        f.write(f"**Prompts used**: {len(selected_prompts)}\n\n")
-
-        f.write("## Summary\n\n")
-        total_files = len(all_results)
-        f.write(f"- **Total files**: {total_files}\n")
-        f.write(f"- **Prompts**: {[name for name, _ in selected_prompts]}\n\n")
-
-        for rel_path, results in all_results:
-            f.write(f"## {rel_path}\n\n")
-
-            for section_name, data in results.items():
-                if "error" in data:
-                    f.write(f"### {section_name.title()}\n")
-                    f.write(f"_Error: {data['error']}_\n\n")
+                # Skip config files
+                if file_path.name in CONFIG_PATTERNS:
                     continue
 
-                f.write(f"### {section_name.title()}\n\n")
+                # Check extension and file size
+                if (file_path.suffix.lower() in EXTENSIONS and
+                    file_path.stat().st_size > MIN_FILE_SIZE):
+                    files.append(str(file_path))
 
-                if "issues" in data and data["issues"]:
-                    for i, issue in enumerate(data["issues"], 1):
-                        f.write(f"**{i}. {issue.get('title', 'Issue')}**\n\n")
-                        sev = issue.get("severity") or issue.get("impact", "unknown")
-                        f.write(f"*Severity*: **{sev}**\n\n")
-                        if "explanation" in issue:
-                            f.write(f"**Explanation**:\n{issue['explanation']}\n\n")
-                        if any(k in issue for k in ["fix", "recommendation", "refactor"]):
-                            fix_key = next((k for k in ["fix", "recommendation", "refactor"] if k in issue), None)
-                            f.write(f"**Fix**:\n{issue[fix_key]}\n\n")
+                    if limit and len(files) >= limit:
+                        return files
 
-                elif "violations" in data and data["violations"]:
-                    for violation in data["violations"]:
-                        f.write(f"- **{violation.get('principle', '')}: {violation.get('title', 'Violation')}** "
-                                f"({violation.get('severity', 'unknown')})\n")
-                        f.write(f"  *Impact*: {violation.get('impact', '')}\n")
-                        f.write(f"  *Fix*: {violation.get('refactor', '')}\n\n")
+        return files
 
-                elif "raw" in data:
-                    f.write("```\n")
-                    f.write(textwrap.fill(data["raw"], width=100, break_long_words=False))
-                    f.write("\n```\n\n")
+
+class ProjectAnalyzer:
+    """Analyzes project structure and context."""
+
+    def __init__(self, repo_root: Path, ollama_client: OllamaClient):
+        """
+        Initialize project analyzer.
+
+        Args:
+            repo_root: Root path of repository
+            ollama_client: Ollama client instance
+        """
+        self.repo_root = repo_root
+        self.ollama_client = ollama_client
+        self.json_extractor = JSONExtractor()
+
+    def collect_metadata(self) -> Dict:
+        """
+        Collect metadata from project configuration files.
+
+        Returns:
+            Dictionary with metadata files and their content
+        """
+        files = []
+        for rel in PROJECT_META_CANDIDATES:
+            p = self.repo_root / rel
+            if p.exists():
+                try:
+                    content = p.read_text(encoding="utf-8", errors="ignore")
+                    files.append({"path": rel, "content": content})
+                except Exception as e:
+                    logger.warning(f"Failed to read {rel}: {e}")
+
+        return {"files": files}
+
+    def build_context_prompt(self) -> str:
+        """
+        Build prompt for project context analysis.
+
+        Returns:
+            Formatted prompt string
+        """
+        meta = self.collect_metadata()
+        files_block = "\n\n".join(
+            f"### {f['path']}\n{f['content']}" for f in meta["files"]
+        )
+        return PROMPTS["project_context"] + "\n\n" + files_block
+
+    def get_context(self) -> Dict:
+        """
+        Analyze project and extract context.
+
+        Returns:
+            Dictionary with architecture summary and practices
+        """
+        prompt = self.build_context_prompt()
+        raw = self.ollama_client.generate(prompt)
+
+        logger.debug("=== RAW PROJECT CONTEXT RESPONSE ===")
+        logger.debug(raw)
+        logger.debug("====================================")
+
+        data = self.json_extractor.extract_object(raw)
+        if isinstance(data, dict):
+            return {
+                "architecture_summary": data.get("architecture_summary", ""),
+                "project_practices": data.get("project_practices", []),
+                "raw": raw,
+            }
+
+        return {"architecture_summary": "", "project_practices": [], "raw": raw}
+
+    def get_practices_diff(self, project_context: Dict) -> List[Dict]:
+        """
+        Compare project practices against industry best practices.
+
+        Args:
+            project_context: Project context dictionary
+
+        Returns:
+            List of practice differences
+        """
+        payload = {
+            "architecture_summary": project_context.get("architecture_summary", ""),
+            "project_practices": project_context.get("project_practices", []),
+        }
+        prompt = PROMPTS["best_practices"] + "\n\n" + json.dumps(
+            payload, ensure_ascii=False, indent=2
+        )
+        raw = self.ollama_client.generate(prompt, num_predict=768)
+
+        logger.debug("=== RAW BEST_PRACTICES RESPONSE ===")
+        logger.debug(raw)
+        logger.debug("===================================")
+
+        data = self.json_extractor.extract_array(raw)
+        return data if isinstance(data, list) else []
+
+
+class FileAuditor:
+    """Audits individual code files for issues."""
+
+    def __init__(self, ollama_client: OllamaClient, repo_root: Path):
+        """
+        Initialize file auditor.
+
+        Args:
+            ollama_client: Ollama client instance
+            repo_root: Root path of repository
+        """
+        self.ollama_client = ollama_client
+        self.repo_root = repo_root
+        self.json_extractor = JSONExtractor()
+
+    def build_audit_prompt(self, project_context: Dict, file_path: str, code: str) -> str:
+        """
+        Build prompt for file audit.
+
+        Args:
+            project_context: Project context dictionary
+            file_path: Relative path to file
+            code: File content
+
+        Returns:
+            Formatted prompt string
+        """
+        if len(code) > MAX_CODE_LENGTH:
+            code = code[:MAX_CODE_LENGTH] + "\n\n[... truncated ...]"
+
+        ctx = {
+            "architecture_summary": project_context.get("architecture_summary", ""),
+            "project_practices": project_context.get("project_practices", []),
+            "file_path": file_path,
+            "code": code,
+        }
+        return PROMPTS["file_audit"] + "\n\n" + json.dumps(
+            ctx, ensure_ascii=False, indent=2
+        )
+
+    def parse_issues(self, raw: str) -> List[Issue]:
+        """
+        Parse issues from model response.
+
+        Args:
+            raw: Raw model response
+
+        Returns:
+            List of Issue objects
+        """
+        data = self.json_extractor.extract_array(raw)
+        if not isinstance(data, list):
+            return []
+
+        issues: List[Issue] = []
+        for item in data:
+            try:
+                issues.append(
+                    Issue(
+                        file_path=item["file_path"],
+                        issue_type=item["issue_type"],
+                        severity=Severity(item["severity"]),
+                        risk=item["risk"],
+                        description=item["description"],
+                        recommendation=item.get("recommendation", ""),
+                        evidence=item.get("evidence"),
+                    )
+                )
+            except (KeyError, ValueError) as e:
+                logger.warning(f"Failed to parse issue: {e}")
+                continue
+        return issues
+
+    def audit_file(
+        self,
+        file_path: str,
+        project_context: Dict
+    ) -> Tuple[List[Issue], Optional[str]]:
+        """
+        Audit a single file.
+
+        Args:
+            file_path: Path to file
+            project_context: Project context dictionary
+
+        Returns:
+            Tuple of (issues list, error message)
+        """
+        file_path_obj = Path(file_path)
+        rel_path = os.path.relpath(file_path_obj, self.repo_root)
+
+        try:
+            code = file_path_obj.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            return [], f"Cannot read file {rel_path}: {e}"
+
+        prompt = self.build_audit_prompt(project_context, rel_path, code)
+        try:
+            raw = self.ollama_client.generate(prompt)
+        except Exception as e:
+            return [], f"Ollama error for {rel_path}: {e}"
+
+        issues = self.parse_issues(raw)
+        return issues, None
+
+
+# ==== Report Generation ====
+
+class IssueAggregator:
+    """Aggregates and summarizes audit issues."""
+
+    @staticmethod
+    def build_tldr(issues: List[Issue]) -> List[str]:
+        """
+        Build TL;DR summary of issues.
+
+        Args:
+            issues: List of issues
+
+        Returns:
+            List of summary lines
+        """
+        if not issues:
+            return [
+                "No issues detected by the automated analyzer. "
+                "Manual review still recommended."
+            ]
+
+        sev_counts = Counter(i.severity.value for i in issues)
+        top_types = Counter(i.issue_type for i in issues).most_common(3)
+
+        lines = [
+            f"Detected {sev_counts.get('high', 0)} high, "
+            f"{sev_counts.get('medium', 0)} medium, "
+            f"{sev_counts.get('low', 0)} low, "
+            f"{sev_counts.get('informational', 0)} informational issues."
+        ]
+        if top_types:
+            types_str = ", ".join(f"{t} ({c})" for t, c in top_types)
+            lines.append(f"Most affected domains: {types_str}.")
+        return lines
+
+    @staticmethod
+    def build_domain_summary(issues: List[Issue]) -> Dict[str, str]:
+        """
+        Build summary by issue domain/type.
+
+        Args:
+            issues: List of issues
+
+        Returns:
+            Dictionary mapping domain to summary text
+        """
+        by_type = defaultdict(list)
+        for i in issues:
+            by_type[i.issue_type].append(i)
+
+        summaries: Dict[str, str] = {}
+        for t, lst in by_type.items():
+            hs = sum(1 for i in lst if i.severity == Severity.HIGH)
+            ms = sum(1 for i in lst if i.severity == Severity.MEDIUM)
+            summaries[t] = (
+                f"{len(lst)} issues ({hs} high, {ms} medium). "
+                f"Focus on addressing high/medium items first."
+            )
+        return summaries
+
+
+class ReportGenerator:
+    """Generates markdown audit reports."""
+
+    def __init__(self):
+        """Initialize report generator."""
+        self.aggregator = IssueAggregator()
+
+    def generate(
+        self,
+        repo_path: str,
+        model: str,
+        project_context: Dict,
+        practices_diff: List[Dict],
+        all_issues: List[Issue],
+        output_path: str,
+    ) -> None:
+        """
+        Generate markdown audit report.
+
+        Args:
+            repo_path: Repository path
+            model: Model name used
+            project_context: Project context dictionary
+            practices_diff: List of practice differences
+            all_issues: All detected issues
+            output_path: Output file path
+        """
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tldr = self.aggregator.build_tldr(all_issues)
+        domain_summary = self.aggregator.build_domain_summary(all_issues)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            self._write_header(f, repo_path, model, ts)
+            self._write_tldr(f, tldr)
+            self._write_domain_summary(f, domain_summary)
+            self._write_practices_diff(f, practices_diff)
+            self._write_detailed_issues(f, all_issues)
+
+    @staticmethod
+    def _write_header(f, repo_path: str, model: str, timestamp: str) -> None:
+        """Write report header."""
+        f.write("# Technical Audit Report\n\n")
+        f.write(f"**Repository**: `{repo_path}`  \n")
+        f.write(f"**Model**: `{model}`  \n")
+        f.write(f"**Generated**: {timestamp}\n\n")
+
+    @staticmethod
+    def _write_tldr(f, tldr: List[str]) -> None:
+        """Write TL;DR section."""
+        f.write("## TL;DR\n\n")
+        for line in tldr:
+            f.write(f"- {line}\n")
+        f.write("\n")
+
+    @staticmethod
+    def _write_domain_summary(f, domain_summary: Dict[str, str]) -> None:
+        """Write summary by domain section."""
+        f.write("## Summary by domain\n\n")
+        for domain, text in domain_summary.items():
+            f.write(f"- **{domain}**: {text}\n")
+        f.write("\n")
+
+    @staticmethod
+    def _sanitize_cell(text: str) -> str:
+        """Sanitize text for markdown table cells."""
+        return text.replace("|", "/").replace("\n", " ")
+
+    def _write_practices_diff(self, f, practices_diff: List[Dict]) -> None:
+        """Write best practices comparison section."""
+        if not practices_diff:
+            return
+
+        f.write("## Industry best practices vs project\n\n")
+        f.write("| Domain | Project practice | Industry best practice | Gap | Severity |\n")
+        f.write("|--------|------------------|------------------------|-----|----------|\n")
+        for row in practices_diff:
+            f.write(
+                f"| {row.get('domain', '')} "
+                f"| {self._sanitize_cell(row.get('project_practice', ''))} "
+                f"| {self._sanitize_cell(row.get('industry_best_practice', ''))} "
+                f"| {self._sanitize_cell(row.get('gap', ''))} "
+                f"| {row.get('severity', '')} |\n"
+            )
+        f.write("\n")
+
+    def _write_detailed_issues(self, f, all_issues: List[Issue]) -> None:
+        """Write detailed issues table."""
+        f.write("## Detailed issues\n\n")
+        f.write("| File | Type | Severity | Risk | Description | Recommendation |\n")
+        f.write("|------|------|----------|------|-------------|----------------|\n")
+        for issue in all_issues:
+            f.write(
+                f"| {issue.file_path} "
+                f"| {issue.issue_type} "
+                f"| {issue.severity.value} "
+                f"| {self._sanitize_cell(issue.risk)} "
+                f"| {self._sanitize_cell(issue.description)} "
+                f"| {self._sanitize_cell(issue.recommendation)} |\n"
+            )
+        f.write("\n")
+
+
+# ==== Main Orchestrator ====
+
+class AuditOrchestrator:
+    """Orchestrates the complete audit process."""
+
+    def __init__(
+        self,
+        repo_path: str,
+        model: str,
+        workers: int = DEFAULT_WORKERS,
+        output_path: Optional[str] = None
+    ):
+        """
+        Initialize audit orchestrator.
+
+        Args:
+            repo_path: Path to repository
+            model: Ollama model name
+            workers: Number of parallel workers
+            output_path: Optional output path for report
+        """
+        self.repo_path = Path(repo_path).resolve()
+        self.model = model
+        self.workers = workers
+        self.output_path = output_path
+
+        # Initialize components
+        self.ollama_client = OllamaClient(model)
+        self.file_scanner = FileScanner(self.repo_path)
+        self.project_analyzer = ProjectAnalyzer(self.repo_path, self.ollama_client)
+        self.file_auditor = FileAuditor(self.ollama_client, self.repo_path)
+        self.report_generator = ReportGenerator()
+
+    def run(self) -> int:
+        """
+        Run the complete audit process.
+
+        Returns:
+            Exit code (0 for success, 1 for failure)
+        """
+        # Validate Ollama is running
+        if not OllamaClient.check_availability():
+            logger.error("❌ Ollama is not running. Start it: ollama serve")
+            return 1
+
+        if not self.repo_path.exists():
+            logger.error(f"❌ Repository not found: {self.repo_path}")
+            return 1
+
+        logger.info(f"🚀 Starting audit of {self.repo_path}")
+        logger.info(f"📊 Model: {self.model}")
+        logger.info(f"⚡ Workers: {self.workers}")
+
+        # Setup output path
+        REPORTS_DIR.mkdir(exist_ok=True)
+        if not self.output_path:
+            timestamp_str = datetime.now().strftime(TIMESTAMP_FORMAT)
+            self.output_path = str(
+                REPORTS_DIR /
+                REPORT_FILENAME_PATTERN.format(timestamp_str)
+            )
+
+        start_time = datetime.now()
+
+        # Step 1: Analyze project context
+        logger.info("📦 Building project context...")
+        project_context = self.project_analyzer.get_context()
+
+        # Step 2: Compare against best practices
+        logger.info("📐 Calculating best practices diff...")
+        practices_diff = self.project_analyzer.get_practices_diff(project_context)
+
+        # Step 3: Scan and audit files
+        code_files = self.file_scanner.scan()[:10]
+        logger.info(f"📁 Found {len(code_files)} files to audit")
+
+        all_issues, errors = self._audit_files(code_files, project_context)
+
+        # Report results
+        total_time = datetime.now() - start_time
+        logger.info(f"\n⏱️  Total time: {total_time}")
+        logger.info(f"📊 Total issues: {len(all_issues)}")
+
+        # Generate report
+        logger.info(f"\n✍️  Generating report: {self.output_path}")
+        self.report_generator.generate(
+            repo_path=str(self.repo_path),
+            model=self.model,
+            project_context=project_context,
+            practices_diff=practices_diff,
+            all_issues=all_issues,
+            output_path=self.output_path,
+        )
+
+        logger.info(f"✅ Audit complete! Report: {self.output_path}")
+        if errors:
+            logger.warning(
+                f"⚠️  There were {len(errors)} file errors. See console output above."
+            )
+
+        return 0
+
+    def _audit_files(
+        self,
+        code_files: List[str],
+        project_context: Dict
+    ) -> Tuple[List[Issue], List[str]]:
+        """
+        Audit multiple files in parallel.
+
+        Args:
+            code_files: List of file paths to audit
+            project_context: Project context dictionary
+
+        Returns:
+            Tuple of (all issues, error messages)
+        """
+        all_issues: List[Issue] = []
+        errors: List[str] = []
+
+        logger.info(f"📝 Processing {len(code_files)} file(s)...")
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {
+                executor.submit(
+                    self.file_auditor.audit_file,
+                    file_path,
+                    project_context
+                ): file_path
+                for file_path in code_files
+            }
+
+            completed = 0
+            for future in as_completed(futures):
+                issues, err = future.result()
+                completed += 1
+
+                if err:
+                    errors.append(err)
+                    logger.warning(f"⚠️  {err}")
                 else:
-                    f.write("_No issues found._\n\n")
+                    all_issues.extend(issues)
+                    logger.info(
+                        f"✅ [{completed}/{len(code_files)}] issues found: {len(issues)}"
+                    )
 
-            f.write("\n---\n\n")
+        return all_issues, errors
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Local AI Code Auditor (Optimized)")
-    parser.add_argument("--path", "-p", required=True, help="Path to repository for audit")
-    parser.add_argument("--out", "-o", default=None, help="Path to Markdown report")
-    parser.add_argument("--model", default="codellama:7b", help="Ollama model name")
-    parser.add_argument("--prompts", nargs="*", default=None, help="List of prompts (security,performance,...)")
-    parser.add_argument("--workers", type=int, default=6, help="Max parallel tasks (default: 6)")
+# ==== CLI Entry Point ====
+
+def main() -> int:
+    """
+    Main entry point for the CLI application.
+
+    Returns:
+        Exit code
+    """
+    parser = argparse.ArgumentParser(
+        description="Local AI Code Auditor with project context analysis",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --path /path/to/repo
+  %(prog)s --path /path/to/repo --model codellama:13b --workers 8
+  %(prog)s --path /path/to/repo --out custom_report.md
+        """
+    )
+    parser.add_argument(
+        "--path", "-p",
+        required=True,
+        help="Path to repository for audit"
+    )
+    parser.add_argument(
+        "--out", "-o",
+        default=None,
+        help="Path to output Markdown report"
+    )
+    parser.add_argument(
+        "--model",
+        default="codellama:7b",
+        help="Ollama model name (default: codellama:7b)"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Max parallel tasks (default: {DEFAULT_WORKERS})"
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose debug logging"
+    )
 
     args = parser.parse_args()
 
-    selected_model = args.model
+    # Set log level
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
 
-    # Check Ollama
-    try:
-        requests.get("http://localhost:11434", timeout=5)
-    except Exception:
-        print("❌ Ollama is not running. Start it: ollama serve")
-        return 1
+    # Create and run orchestrator
+    orchestrator = AuditOrchestrator(
+        repo_path=args.path,
+        model=args.model,
+        workers=args.workers,
+        output_path=args.out
+    )
 
-    repo_path = os.path.abspath(args.path)
-    if not os.path.exists(repo_path):
-        print(f"❌ Repository not found: {repo_path}")
-        return 1
-
-    # Select prompts
-    selected_prompts = ALL_PROMPTS
-    if args.prompts:
-        selected_prompts = [(name, PROMPTS[name]) for name in args.prompts if name in PROMPTS]
-        if not selected_prompts:
-            print("❌ Unknown prompts. Available:", ", ".join(PROMPTS.keys()))
-            return 1
-
-    print(f"🚀 Starting OPTIMIZED audit of {repo_path}")
-    print(f"📊 Model: {selected_model}")
-    print(f"🎯 Prompts: {[name for name, _ in selected_prompts]}")
-    print(f"⚡ Workers: {args.workers}")
-
-    reports_dir = Path("reports")
-    reports_dir.mkdir(exist_ok=True)
-
-    out_path = args.out or reports_dir / f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-
-    start_time = datetime.now()
-
-    code_files = iter_code_files(repo_path)
-    print(f"📁 Found files: {len(code_files)}")
-
-    # ✅ CREATE FLAT TASK LIST (no nested loops)
-    tasks = []
-    for file_path in code_files:
-        for prompt_name, prompt_template in selected_prompts:
-            tasks.append((file_path, repo_path, prompt_name, prompt_template, selected_model))
-
-    print(f"📝 Total tasks: {len(tasks)} (files × prompts)")
-
-    # ✅ SINGLE-LEVEL PARALLELIZATION
-    all_results_raw = []
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(audit_task, task): task for task in tasks}
-
-        completed = 0
-        for future in as_completed(futures):
-            try:
-                rel_path, prompt_name, result = future.result()
-                all_results_raw.append((rel_path, prompt_name, result))
-                completed += 1
-                print(f"✅ [{completed}/{len(tasks)}] {rel_path} ({prompt_name})")
-            except Exception as e:
-                print(f"❌ Error: {e}")
-
-    # ✅ MERGE RESULTS BY FILE
-    all_results = {}
-    for rel_path, prompt_name, result in all_results_raw:
-        if rel_path not in all_results:
-            all_results[rel_path] = {}
-        all_results[rel_path][prompt_name] = result
-
-    all_results = list(all_results.items())
-
-    total_time = datetime.now() - start_time
-    print(f"\n⏱️  Total time: {total_time}")
-
-    print(f"\n✍️ Generating report: {out_path}")
-    generate_report(all_results, repo_path, out_path, selected_model, selected_prompts)
-
-    print(f"✅ Audit complete! Report: {out_path}")
-    print(f"📊 Files analyzed: {len(all_results)}")
-
-    return 0
+    return orchestrator.run()
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
+
