@@ -668,7 +668,7 @@ class AuditOrchestrator:
         practices_diff = self.project_analyzer.get_practices_diff(project_context)
 
         # Step 3: Scan and audit files
-        code_files = self.file_scanner.scan()[:10]
+        code_files = self.file_scanner.scan()
         logger.info(f"📁 Found {len(code_files)} files to audit")
 
         all_issues, errors = self._audit_files(code_files, project_context)
