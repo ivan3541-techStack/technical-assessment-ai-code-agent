@@ -377,11 +377,28 @@ class FileAuditor:
         """
         data = self.json_extractor.extract_array(raw)
         if not isinstance(data, list):
+            logger.debug(f"Invalid JSON array: {raw[:200]}...")
             return []
 
         issues: List[Issue] = []
-        for item in data:
+        for i, item in enumerate(data):
+            # Skip non-dict items (mistral bug)
+            if not isinstance(item, dict):
+                logger.warning(f"Issue {i}: expected dict, got {type(item)}")
+                continue
+
             try:
+                # Validate required fields
+                required = ["file_path", "issue_type", "severity", "risk", "description"]
+                if not all(k in item for k in required):
+                    logger.warning(f"Issue {i} missing fields: {set(required) - set(item.keys())}")
+                    continue
+
+                # Validate severity enum
+                if item["severity"] not in ["high", "medium", "low", "informational"]:
+                    logger.warning(f"Issue {i} invalid severity: {item['severity']}")
+                    continue
+
                 issues.append(
                     Issue(
                         file_path=item["file_path"],
@@ -390,13 +407,15 @@ class FileAuditor:
                         risk=item["risk"],
                         description=item["description"],
                         recommendation=item.get("recommendation", ""),
-                        evidence=item.get("evidence"),
+                        evidence=item.get("evidence", ""),
                     )
                 )
             except (KeyError, ValueError) as e:
-                logger.warning(f"Failed to parse issue: {e}")
+                logger.warning(f"Issue {i} parse error: {e}")
                 continue
+
         return issues
+
 
     def audit_file(
         self,
